@@ -60,3 +60,7 @@ and [acceptance status](ACCEPTANCE.md) for the limits of the evidence.
 
 [Architecture](ARCHITECTURE.md) · [Configuration](CONFIGURATION.md) ·
 [Security](SECURITY.md) · [Migration](MIGRATION.md) · [Compatibility](COMPATIBILITY.md).
+
+Git checkouts include the compiled worker and CLI. CI checks that a rebuild matches
+the committed distribution. Autoskills and subagent-router pin the Pi SDK as a runtime
+dependency for their isolated child process; the other extensions use the host SDK.
