@@ -138,6 +138,12 @@ export function shouldReplan(e: ReplanEvidence): boolean {
   );
 }
 export class Planner implements Service {
+  menuGroups = {
+    Plan: ["status", "show", "create", "replan"],
+    History: ["history"],
+    Settings: ["config", "doctor", "off"],
+  };
+  menuInputs = { create: "Project-relative plan JSON file" };
   capabilities = ["plan.adaptive.v1", "plan.dag.v1"];
   menu = ["status", "show", "history", "create", "replan", "explain"];
   private decision?: PlanDecision;
