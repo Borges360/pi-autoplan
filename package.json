@@ -55,18 +55,15 @@
     "schemas": "npm run build && node scripts/generate-schema.mjs"
   },
   "dependencies": {
-    "typebox": "1.3.27",
     "yaml": "2.9.0",
     "fast-xml-parser": "5.11.2"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "1.2.0",
-    "@earendil-works/pi-durable": "1.2.0"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-durable": "1.2.0",
+    "typebox": "*"
   },
   "peerDependenciesMeta": {
-    "@earendil-works/pi-coding-agent": {
-      "optional": true
-    },
     "@earendil-works/pi-durable": {
       "optional": true
     }
@@ -77,6 +74,7 @@
     "typescript": "5.9.3",
     "@earendil-works/pi-durable": "1.2.0",
     "@earendil-works/chord": "1.2.0",
-    "prettier": "3.9.10"
+    "prettier": "3.9.10",
+    "typebox": "1.3.27"
   }
 }
