@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,6 +15,13 @@ const name = JSON.parse(
 )
   .name.split("/")
   .at(-1);
+const displayName =
+  {
+    "pi-autoskills": "AutoSkills",
+    "pi-autoplan": "AutoPlan",
+    "pi-subagent-router": "Subagent Router",
+    "pi-mcp-router": "MCP Router",
+  }[name] ?? name;
 test("event bus ignores duplicates, future schemas, old events and isolates consumer failures", async () => {
   const bus = localBus();
   const a = new Interop("a", bus, "project");
@@ -146,6 +153,8 @@ test("extension loads independently and all discovery commands work without TUI"
     ctx,
   );
   const menus = [];
+  let rootSelections = 0;
+  let settingsSelections = 0;
   const tui = {
     ...ctx,
     mode: "tui",
@@ -153,15 +162,113 @@ test("extension loads independently and all discovery commands work without TUI"
     ui: {
       select: async (title, choices) => {
         menus.push({ title, choices });
-        return choices.includes("Settings") ? "Settings" : "doctor";
+        if (title === displayName)
+          return rootSelections++ === 0 ? "Settings" : undefined;
+        return settingsSelections++ === 0 ? "doctor" : undefined;
       },
     },
   };
   await command.handler("", tui);
-  assert.equal(menus.length, 2);
+  assert.equal(menus.length, 4);
   assert.ok(menus[0].choices.includes("Settings"));
-  assert.equal(menus[1].title, "Settings");
+  assert.equal(menus[1].title, `${displayName} / Settings`);
+  assert.equal(menus[2].title, `${displayName} / Settings`);
+  assert.equal(menus[3].title, displayName);
+  assert.ok(menus[1].choices.includes("config"));
+  assert.equal(menus[1].choices.includes("off"), false);
   assert.equal(JSON.parse(messages.at(-1).content).standalone, true);
+
+  const keybindings = {
+    getKeys: (binding) =>
+      ({
+        "tui.select.confirm": ["enter"],
+        "tui.select.cancel": ["escape"],
+        "tui.select.up": ["up"],
+        "tui.select.down": ["down"],
+      })[binding] ?? [],
+    matches: (data, binding) =>
+      ({
+        "tui.select.confirm": "enter",
+        "tui.select.cancel": "escape",
+        "tui.select.up": "up",
+        "tui.select.down": "down",
+      })[binding] === data,
+  };
+  const configMenus = [];
+  let panelRuns = 0;
+  let closedPanels = 0;
+  let renderRequests = 0;
+  const configTui = {
+    ...tui,
+    ui: {
+      select: async (title, choices) => {
+        configMenus.push({ title, choices });
+        return undefined;
+      },
+      custom: async (factory, options) => {
+        assert.equal(options.overlay, true);
+        const panel = await factory(
+          { requestRender: () => renderRequests++ },
+          {
+            fg: (_color, value) => value,
+            bg: (_color, value) => value,
+            bold: (value) => value,
+          },
+          keybindings,
+          () => closedPanels++,
+        );
+        const render = () =>
+          panel
+            .render(80)
+            .map((line) => line.trimEnd())
+            .join("\n");
+        assert.match(render(), new RegExp(`${displayName} / Settings / Mode`));
+        assert.match(render(), /Current mode: Automatic/);
+        assert.match(render(), /Choose a mode\n› Automatic  \(current\)/);
+        await panel.handleInput("down");
+        assert.match(render(), /› Observe/);
+        if (panelRuns++ === 0) {
+          await panel.handleInput("escape");
+          const unchanged = JSON.parse(
+            await readFile(
+              join(defaults(name).storage.root, "config.json"),
+              "utf8",
+            ),
+          );
+          assert.equal(unchanged.mode, "auto");
+          assert.equal(unchanged.enabled, true);
+        } else {
+          await panel.handleInput("enter");
+          assert.match(render(), /Current mode: Observe/);
+          assert.match(render(), /Saved: Observe\./);
+          const saved = JSON.parse(
+            await readFile(
+              join(defaults(name).storage.root, "config.json"),
+              "utf8",
+            ),
+          );
+          assert.equal(saved.mode, "observe");
+          assert.equal(saved.enabled, true);
+          await panel.handleInput("escape");
+        }
+      },
+    },
+  };
+  await command.handler("config", configTui);
+  await command.handler("config", configTui);
+  assert.equal(panelRuns, 2);
+  assert.equal(closedPanels, 2);
+  assert.equal(renderRequests, 3);
+  assert.deepEqual(
+    configMenus.map(({ title }) => title),
+    [
+      `${displayName} / Settings`,
+      displayName,
+      `${displayName} / Settings`,
+      displayName,
+    ],
+  );
+
   const priorMessages = messages.length;
   await command.handler("", { ...tui, ui: { select: async () => undefined } });
   assert.equal(messages.length, priorMessages);
