@@ -138,10 +138,15 @@ export function shouldReplan(e: ReplanEvidence): boolean {
   );
 }
 export class Planner implements Service {
+  modeDescriptions = {
+    auto: "Create bounded plans for eligible tasks.",
+    observe: "Show planning decisions without applying a plan.",
+    off: "Disable automatic planning.",
+  };
   menuGroups = {
     Plan: ["status", "show", "create", "replan"],
     History: ["history"],
-    Settings: ["config", "doctor", "off"],
+    Settings: ["config", "doctor"],
   };
   menuInputs = { create: "Project-relative plan JSON file" };
   capabilities = ["plan.adaptive.v1", "plan.dag.v1"];
