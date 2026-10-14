@@ -49,6 +49,11 @@ export declare function validatePlan(tasks: PlanTask[], maxTasks?: number, maxDe
 export declare function shouldReplan(e: ReplanEvidence): boolean;
 export declare class Planner implements Service {
     readonly host: Host;
+    modeDescriptions: {
+        auto: string;
+        observe: string;
+        off: string;
+    };
     menuGroups: {
         Plan: string[];
         History: string[];

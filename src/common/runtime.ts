@@ -36,6 +36,7 @@ export interface Service {
   menu: string[];
   menuGroups?: Record<string, string[]>;
   menuInputs?: Record<string, string>;
+  modeDescriptions?: Partial<Record<"auto" | "observe" | "off", string>>;
   command(
     action: string,
     args: string[],
@@ -343,37 +344,223 @@ export function register(
     handler: async (args, ctx) => {
       const h = await get(ctx);
       let parts = args.trim().split(/\s+/).filter(Boolean);
-      if (!parts.length && ctx.mode === "tui" && ctx.hasUI) {
-        const groups = h.service.menuGroups ?? {
-          Actions: h.service.menu,
-          Settings: ["config", "doctor", "off"],
-        };
-        const group = await ctx.ui.select(extension, Object.keys(groups));
-        if (!group) return;
-        const selected = await ctx.ui.select(group, groups[group] ?? []);
-        if (!selected) return;
-        parts = selected.split(/\s+/);
-        const inputTitle = h.service.menuInputs?.[selected];
-        if (inputTitle) {
-          const value = await ctx.ui.input(inputTitle);
-          if (!value?.trim()) return;
-          parts.push(value.trim());
+      const interactive = ctx.mode === "tui" && ctx.hasUI;
+      const displayNames: Record<string, string> = {
+        longrun: "Longrun",
+        autoskills: "AutoSkills",
+        autoplan: "AutoPlan",
+        subagents: "Subagent Router",
+        mcprouter: "MCP Router",
+      };
+      const displayName = displayNames[command] ?? extension;
+      const groups = h.service.menuGroups ?? {
+        Actions: h.service.menu,
+        Settings: ["config", "doctor"],
+      };
+      const options = [
+        {
+          action: "auto" as const,
+          label: "Automatic",
+          description:
+            h.service.modeDescriptions?.auto ??
+            "Allow eligible actions when this extension's policy permits.",
+        },
+        {
+          action: "observe" as const,
+          label: "Observe",
+          description:
+            h.service.modeDescriptions?.observe ??
+            "Show decisions without acting automatically.",
+        },
+        {
+          action: "off" as const,
+          label: "Off",
+          description:
+            h.service.modeDescriptions?.off ??
+            "Disable this extension's automatic behavior.",
+        },
+      ];
+      const formatKey = (key: string) =>
+        ({
+          enter: "Enter",
+          return: "Enter",
+          escape: "Esc",
+          "ctrl+c": "Ctrl+C",
+          up: "↑",
+          down: "↓",
+        })[key.toLowerCase()] ?? key.toUpperCase();
+      const keyText = (keys: string[], fallback: string) =>
+        keys.map(formatKey).join(" / ") || fallback;
+      const currentMode = () =>
+        !h.config.enabled || h.config.mode === "off"
+          ? "off"
+          : h.config.mode === "observe"
+            ? "observe"
+            : "auto";
+      const showModePanel = async () => {
+        let activeAction = currentMode();
+        let selectedIndex = options.findIndex(
+          (option) => option.action === activeAction,
+        );
+        let status = "";
+        await ctx.ui.custom<void>(
+          (tui, theme, keybindings, done) => {
+            let saving = false;
+            const confirmKeys = keyText(
+              keybindings.getKeys("tui.select.confirm"),
+              "Enter",
+            );
+            const cancelKeys = keyText(
+              keybindings.getKeys("tui.select.cancel"),
+              "Esc",
+            );
+            const upKeys = keyText(keybindings.getKeys("tui.select.up"), "↑");
+            const downKeys = keyText(
+              keybindings.getKeys("tui.select.down"),
+              "↓",
+            );
+            const fit = (line: string, width: number) =>
+              line.length <= width
+                ? line
+                : line.slice(0, Math.max(0, width - 1)) + "…";
+
+            return {
+              render(width) {
+                const current =
+                  options.find((option) => option.action === activeAction) ??
+                  options[0]!;
+                const selected = options[selectedIndex]!;
+                const lines = [
+                  `${displayName} / Settings / Mode`,
+                  "",
+                  `Current mode: ${current.label}`,
+                  "",
+                  "Choose a mode",
+                  ...options.map(
+                    (option, index) =>
+                      `${index === selectedIndex ? "›" : " "} ${option.label}${
+                        option.action === activeAction ? "  (current)" : ""
+                      }`,
+                  ),
+                  "",
+                  selected.description,
+                  "",
+                  `${upKeys} / ${downKeys} Move    ${confirmKeys} Save    ${cancelKeys} Back`,
+                  status,
+                ];
+                return lines.map((line, index) => {
+                  const visible = fit(line, width).padEnd(width, " ");
+                  const selectedRow = index === 5 + selectedIndex;
+                  const foreground =
+                    index === 0 || index === 4 || selectedRow
+                      ? theme.fg("accent", theme.bold(visible))
+                      : theme.fg("toolOutput", visible);
+                  return theme.bg("toolPendingBg", foreground);
+                });
+              },
+              invalidate() {},
+              async handleInput(data) {
+                if (keybindings.matches(data, "tui.select.cancel")) {
+                  done(undefined);
+                  return;
+                }
+                if (keybindings.matches(data, "tui.select.up")) {
+                  selectedIndex =
+                    (selectedIndex + options.length - 1) % options.length;
+                  tui.requestRender();
+                  return;
+                }
+                if (keybindings.matches(data, "tui.select.down")) {
+                  selectedIndex = (selectedIndex + 1) % options.length;
+                  tui.requestRender();
+                  return;
+                }
+                if (saving || !keybindings.matches(data, "tui.select.confirm"))
+                  return;
+                saving = true;
+                try {
+                  const selected = options[selectedIndex]!;
+                  await h.serial(() =>
+                    h.command(selected.action, [], {
+                      cwd: ctx.cwd,
+                      trusted: ctx.isProjectTrusted(),
+                      hostContext: ctx,
+                      commandContext: ctx,
+                      signal: ctx.signal,
+                    }),
+                  );
+                  activeAction = selected.action;
+                  status = `Saved: ${selected.label}.`;
+                } catch {
+                  status = "Could not save the mode. Try again.";
+                } finally {
+                  saving = false;
+                  tui.requestRender();
+                }
+              },
+            };
+          },
+          {
+            overlay: true,
+            overlayOptions: {
+              width: "72%",
+              maxHeight: 15,
+              anchor: "center",
+              margin: 1,
+            },
+          },
+        );
+      };
+      const runMenu = async (initialGroup?: string) => {
+        let group = initialGroup;
+        while (true) {
+          if (!group) {
+            group = await ctx.ui.select(displayName, Object.keys(groups));
+            if (!group) return;
+          }
+          const selected = await ctx.ui.select(
+            `${displayName} / ${group}`,
+            groups[group] ?? [],
+          );
+          if (!selected) {
+            group = undefined;
+            continue;
+          }
+          let selectedParts = selected.split(/\s+/);
+          const selectedAction = selectedParts[0] ?? "status";
+          if (selectedAction === "config" || selectedAction === "mode") {
+            await showModePanel();
+            continue;
+          }
+          const inputTitle = h.service.menuInputs?.[selected];
+          if (inputTitle) {
+            const value = await ctx.ui.input(inputTitle);
+            if (!value?.trim()) continue;
+            selectedParts.push(value.trim());
+          }
+          const action = selectedParts.shift() ?? "status";
+          const result = await h.serial(() =>
+            h.command(action, selectedParts, {
+              cwd: ctx.cwd,
+              trusted: ctx.isProjectTrusted(),
+              hostContext: ctx,
+              commandContext: ctx,
+              signal: ctx.signal,
+            }),
+          );
+          show(result);
         }
+      };
+      if (interactive && !parts.length) {
+        await runMenu();
+        return;
       }
       let action = parts.shift() ?? "status";
-      if (action === "config" && ctx.mode === "tui" && ctx.hasUI) {
-        const setting = await ctx.ui.select("Settings", [
-          "Enable automatic mode",
-          "Observe decisions",
-          "Disable",
-        ]);
-        if (!setting) return;
-        action =
-          setting === "Enable automatic mode"
-            ? "auto"
-            : setting === "Observe decisions"
-              ? "observe"
-              : "off";
+      if (action === "mode") action = "config";
+      if (interactive && action === "config") {
+        await showModePanel();
+        await runMenu("Settings");
+        return;
       }
       show(
         await h.serial(() =>
