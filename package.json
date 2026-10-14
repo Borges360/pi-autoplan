@@ -1,6 +1,6 @@
 {
   "name": "@borges360/pi-autoplan",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "pi-autoplan — independent, evidence-driven Pi extension",
   "type": "module",
   "license": "MIT",

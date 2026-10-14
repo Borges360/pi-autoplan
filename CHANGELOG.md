@@ -1,10 +1,14 @@
 # Changelog
 
+## 0.1.2 — 2026-10-14
+
++Use the shared English mode picker with a current-mode marker, concise descriptions and keyboard navigation.
+Use Escape to return through Settings and categories; remove the duplicate Off action from Settings.
+
 ## 0.1.1 — 2026-10-13
 
 - Declare host-provided Pi SDK and Typebox packages as peer dependencies, preventing duplicate runtime copies and extension-loader warnings.
 - Resolve isolated child-worker modules from the active Pi installation.
-
 
 ## 0.1.0 — 2026-10-13
 
