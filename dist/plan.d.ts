@@ -61,6 +61,7 @@ export declare class Planner implements Service {
     };
     menuInputs: {
         create: string;
+        validate: string;
     };
     capabilities: string[];
     menu: string[];

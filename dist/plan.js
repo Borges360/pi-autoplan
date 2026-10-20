@@ -91,11 +91,14 @@ export class Planner {
         off: "Disable automatic planning.",
     };
     menuGroups = {
-        Plan: ["status", "show", "create", "replan"],
-        History: ["history"],
-        Settings: ["config", "doctor"],
+        Plan: ["status", "show", "create", "validate", "replan"],
+        History: ["history", "explain"],
+        Settings: ["config", "doctor", "storage status"],
     };
-    menuInputs = { create: "Project-relative plan JSON file" };
+    menuInputs = {
+        create: "Create plan: project-relative JSON file (Esc cancels)",
+        validate: "Validate plan: project-relative JSON file (Esc cancels)",
+    };
     capabilities = ["plan.adaptive.v1", "plan.dag.v1"];
     menu = ["status", "show", "history", "create", "replan", "explain"];
     decision;
@@ -235,8 +238,18 @@ export class Planner {
             };
     }
     async command(action, args, context) {
-        if (action === "status" || action === "show")
-            return { decision: this.decision, plan: await this.current() };
+        if (action === "status" || action === "show") {
+            const plan = await this.current();
+            return {
+                decision: this.decision,
+                plan,
+                ...(!plan
+                    ? {
+                        next: "No plan yet. Use autoplan_update or /autoplan create <plan.json>.",
+                    }
+                    : {}),
+            };
+        }
         if (action === "explain")
             return this.decision ?? { reason: "no-assessment-yet" };
         if (action === "history")
@@ -261,8 +274,15 @@ export class Planner {
                 verified: true,
                 evidenceRef: "user-" + id(),
             };
-            if (!args.length)
-                return this.requestReplan(evidence);
+            if (!args.length) {
+                const request = await this.requestReplan(evidence);
+                return {
+                    ...request,
+                    next: request.requested
+                        ? "Replan request recorded. The current Pi model can apply a revision with autoplan_update and this requestId; the existing plan is unchanged until then."
+                        : "Create a plan first, or review the replan limit shown in reason.",
+                };
+            }
             const input = JSON.parse(await readFile(await contained(context.cwd, args[0]), "utf8"));
             return this.update(input, evidence);
         }

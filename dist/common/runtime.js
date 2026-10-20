@@ -1,6 +1,7 @@
 import { mkdir, readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { hostname } from "node:os";
+import { wrapTextWithAnsi, truncateToWidth } from "@earendil-works/pi-tui";
 import { loadConfig, saveConfig } from "./config.js";
 import { FileStorage, SqliteStorage, } from "./storage.js";
 import { DurableStorage } from "./durable.js";
@@ -281,6 +282,41 @@ export function register(pi, extension, command, factory, tools = []) {
                 mcprouter: "MCP Router",
             };
             const displayName = displayNames[command] ?? extension;
+            // A transcript message is hidden as soon as the next selector takes focus.
+            // Keep results (including failures) focused until the user goes back.
+            const showResult = async (action, value) => {
+                show(value);
+                if (!ctx.ui.custom) {
+                    ctx.ui.notify?.(JSON.stringify(redact(value), null, 2), "info");
+                    return;
+                }
+                const text = JSON.stringify(redact(value), null, 2) ?? "No result.";
+                let offset = 0;
+                await ctx.ui.custom((tui, theme, keys, done) => ({
+                    render(width) {
+                        const columns = Math.max(1, width - 2);
+                        const lines = wrapTextWithAnsi(text, columns);
+                        const height = Math.max(1, Math.min(16, tui.terminal.rows - 6));
+                        offset = Math.min(offset, Math.max(0, lines.length - height));
+                        return [
+                            theme.fg("accent", truncateToWidth(`${displayName} / ${action}`, width)),
+                            ...lines.slice(offset, offset + height),
+                            theme.fg("dim", truncateToWidth(`↑ / ↓ Scroll · Enter / Esc Back · ${offset + 1}/${lines.length}`, width)),
+                        ];
+                    },
+                    invalidate() { },
+                    handleInput(data) {
+                        if (keys.matches(data, "tui.select.cancel") ||
+                            keys.matches(data, "tui.select.confirm"))
+                            return done(undefined);
+                        if (keys.matches(data, "tui.select.up"))
+                            offset = Math.max(0, offset - 1);
+                        if (keys.matches(data, "tui.select.down"))
+                            offset++;
+                        tui.requestRender();
+                    },
+                }));
+            };
             const groups = h.service.menuGroups ?? {
                 Actions: h.service.menu,
                 Settings: ["config", "doctor"],
@@ -329,9 +365,7 @@ export function register(pi, extension, command, factory, tools = []) {
                     const cancelKeys = keyText(keybindings.getKeys("tui.select.cancel"), "Esc");
                     const upKeys = keyText(keybindings.getKeys("tui.select.up"), "↑");
                     const downKeys = keyText(keybindings.getKeys("tui.select.down"), "↓");
-                    const fit = (line, width) => line.length <= width
-                        ? line
-                        : line.slice(0, Math.max(0, width - 1)) + "…";
+                    const fit = (line, width) => truncateToWidth(line, width, "…", true);
                     return {
                         render(width) {
                             const current = options.find((option) => option.action === activeAction) ??
@@ -351,7 +385,7 @@ export function register(pi, extension, command, factory, tools = []) {
                                 status,
                             ];
                             return lines.map((line, index) => {
-                                const visible = fit(line, width).padEnd(width, " ");
+                                const visible = fit(line, width);
                                 const selectedRow = index === 5 + selectedIndex;
                                 const foreground = index === 0 || index === 4 || selectedRow
                                     ? theme.fg("accent", theme.bold(visible))
@@ -437,14 +471,22 @@ export function register(pi, extension, command, factory, tools = []) {
                         selectedParts.push(value.trim());
                     }
                     const action = selectedParts.shift() ?? "status";
-                    const result = await h.serial(() => h.command(action, selectedParts, {
-                        cwd: ctx.cwd,
-                        trusted: ctx.isProjectTrusted(),
-                        hostContext: ctx,
-                        commandContext: ctx,
-                        signal: ctx.signal,
-                    }));
-                    show(result);
+                    try {
+                        const result = await h.serial(() => h.command(action, selectedParts, {
+                            cwd: ctx.cwd,
+                            trusted: ctx.isProjectTrusted(),
+                            hostContext: ctx,
+                            commandContext: ctx,
+                            signal: ctx.signal,
+                        }));
+                        await showResult(action, result);
+                    }
+                    catch (error) {
+                        await showResult(action, {
+                            error: error instanceof Error ? error.message : String(error),
+                            next: "Correct the input and try again. Esc returns to the menu.",
+                        });
+                    }
                 }
             };
             if (interactive && !parts.length) {
