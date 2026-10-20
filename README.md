@@ -39,6 +39,15 @@ option. Use the arrow keys to choose, Enter to save, and Escape to return to
 Settings. Headless config returns validated settings. Edit the user config for
 advanced settings.
 
+Every menu action keeps its result visible until Enter or Escape. Use ↑ / ↓ to
+scroll long results; returning preserves the selected category. Invalid JSON,
+missing files and other action errors appear in that same view so you can retry.
+Plan **create** and **validate** ask for a project-relative JSON file (paths with
+spaces work); Escape cancels without writing. An empty status/show explains how
+to create the first plan. **replan** records a request for the current Pi model;
+it shows the request ID and next step, and does not claim a revision was applied.
+History includes **explain** and Settings includes **storage status**.
+
 Default state: `~/.pi/agent/state/pi-autoplan/projects/<sha256-of-canonical-repository-root>/`.
 `PI_ECOSYSTEM_STATE_ROOT` changes the parent state directory for testing or deployment.
 No project state is written implicitly.
