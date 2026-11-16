@@ -17,7 +17,10 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
+      # Os testes de menu exigem uma raiz isolada explícita (tests/menu-actions.test.mjs).
       - run: npm test
+        env:
+          CT56_MENU_TEST_ROOT: ${{ runner.temp }}/ct56-menu
       - run: git diff --exit-code -- dist
       - run: npm run benchmark
       - run: npm pack --dry-run
