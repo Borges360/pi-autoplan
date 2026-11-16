@@ -1,4 +1,5 @@
 import { Type } from "typebox";
+import type { ExtensionContext, InputEvent, InputEventResult, MessageEndEvent, MessageEndEventResult, ModelSelectEvent } from "@earendil-works/pi-coding-agent";
 import { type Assessment } from "./common/contracts.js";
 import type { Host, Service, CommandContext } from "./common/runtime.js";
 export type PlanMode = "none" | "micro" | "full";
@@ -15,6 +16,28 @@ export interface PlanTask {
     acceptance: string[];
     scope?: string[];
 }
+export interface PlanProposalCriterion {
+    behavior: string;
+    verification: string;
+    responsible: "automated" | "human" | "user" | "mixed" | "unknown";
+    status: "proposed";
+}
+export interface PlanProposalDecision {
+    topic: string;
+    choice: string;
+    origin: "user" | "suggested";
+}
+export interface PlanProposalDraft {
+    schemaVersion: 1;
+    title: string;
+    objective: string;
+    scope: string[];
+    outOfScope: string[];
+    decisions: PlanProposalDecision[];
+    assumptions: string[];
+    acceptance: PlanProposalCriterion[];
+    tasks: PlanTask[];
+}
 export interface AdaptivePlan {
     schemaVersion: 1;
     id: string;
@@ -26,6 +49,7 @@ export interface AdaptivePlan {
     replans: number;
     status: "active" | "completed";
     decision: PlanDecision;
+    sourceProposalId?: string;
 }
 export interface ReplanEvidence {
     schemaVersion: 1;
@@ -46,9 +70,22 @@ export declare const PlanInputSchema: Type.TObject<{
 }>;
 export declare function decidePlanMode(s: Assessment, dependencies?: number, multiSubsystem?: boolean): PlanDecision;
 export declare function validatePlan(tasks: PlanTask[], maxTasks?: number, maxDepth?: number): void;
+export declare function parsePlanProposalBlock(content: string, options?: {
+    maxTasks?: number;
+    maxDepth?: number;
+}): {
+    proposal: PlanProposalDraft;
+    block: string;
+} | undefined;
 export declare function shouldReplan(e: ReplanEvidence): boolean;
 export declare class Planner implements Service {
     readonly host: Host;
+    private workMode;
+    private discoveryStyle;
+    private awaitingDiscoveryChoice;
+    private pendingFirstInput?;
+    private proposalDraft?;
+    private workModeLocale;
     modeDescriptions: {
         auto: string;
         observe: string;
@@ -61,16 +98,39 @@ export declare class Planner implements Service {
     };
     menuInputs: {
         create: string;
+        validate: string;
     };
     capabilities: string[];
     menu: string[];
     private decision?;
     constructor(host: Host);
+    private isStoredProposal;
+    sessionStart(context: ExtensionContext): Promise<void>;
+    modelSelect(event: ModelSelectEvent, context: ExtensionContext): Promise<void>;
+    private noModelSelected;
+    private consumePendingInput;
+    private selectDiscoveryStyle;
+    input(event: InputEvent, context: ExtensionContext): Promise<InputEventResult | undefined>;
+    planModePrompt(_prompt: string, _context: ExtensionContext): Promise<{
+        protocol: string;
+        mode: string;
+        discoveryStyle: "propose" | "essential" | "stepwise";
+        instructions: string[];
+    } | undefined>;
+    planModeMessageEnd(event: MessageEndEvent, context: ExtensionContext): Promise<MessageEndEventResult | undefined>;
+    private reviewProposal;
+    guardToolCall(_event: unknown, _context: ExtensionContext): Promise<{
+        block: true;
+        reason: string;
+    } | undefined>;
+    private toggleWorkMode;
+    private configureShortcut;
     start(): Promise<void>;
     current(): Promise<AdaptivePlan | null>;
     update(input: {
         objective: string;
         tasks: PlanTask[];
+        sourceProposalId?: string;
     }, evidence?: ReplanEvidence): Promise<AdaptivePlan>;
     requestReplan(evidence: ReplanEvidence): Promise<{
         requested: boolean;

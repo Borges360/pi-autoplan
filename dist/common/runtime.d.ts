@@ -1,11 +1,13 @@
-import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext, InputEvent, InputEventResult, MessageEndEvent, MessageEndEventResult, ModelSelectEvent, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type Config } from "./config.js";
+import { type Locale } from "./i18n.js";
 import { type StorageBase } from "./storage.js";
 import { Interop, type EventBus } from "./contracts.js";
 export interface CommandContext {
     cwd: string;
     trusted: boolean;
     signal?: AbortSignal;
+    locale?: Locale;
     hostContext?: ExtensionContext;
     commandContext?: ExtensionCommandContext;
 }
@@ -17,8 +19,17 @@ export interface Service {
     modeDescriptions?: Partial<Record<"auto" | "observe" | "off", string>>;
     command(action: string, args: string[], context: CommandContext): Promise<unknown>;
     start?(): Promise<void>;
+    sessionStart?(context: ExtensionContext): Promise<void>;
     close?(): Promise<void>;
+    input?(event: InputEvent, context: ExtensionContext): Promise<InputEventResult | undefined>;
+    modelSelect?(event: ModelSelectEvent, context: ExtensionContext): Promise<void>;
     prompt?(prompt: string, context: ExtensionContext): Promise<unknown>;
+    planModePrompt?(prompt: string, context: ExtensionContext): Promise<unknown>;
+    planModeMessageEnd?(event: MessageEndEvent, context: ExtensionContext): Promise<MessageEndEventResult | undefined>;
+    guardToolCall?(event: unknown, context: ExtensionContext): Promise<{
+        block: true;
+        reason: string;
+    } | undefined>;
     toolCall?(event: unknown, context: ExtensionContext): Promise<{
         block: true;
         reason: string;
@@ -130,6 +141,6 @@ export declare class Host {
         backupPreserved: boolean;
     }>;
 }
-export declare function register(pi: ExtensionAPI, extension: string, command: string, factory: ServiceFactory, tools?: ToolDefinition[]): {
+export declare function register(pi: ExtensionAPI, extension: string, command: string, factory: ServiceFactory, tools?: ToolDefinition[], aliases?: string[]): {
     get: (ctx: ExtensionContext) => Promise<Host>;
 };

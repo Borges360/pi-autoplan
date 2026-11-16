@@ -10,7 +10,7 @@ node dist/cli.js storage migrate durable
 node dist/cli.js storage migrate files
 ```
 
-The slash-command equivalent is `/autoplan storage migrate <backend>`.
+The slash-command equivalent is `/plan storage migrate <backend>`.
 Install optional Pi Durable 1.2.0 explicitly before choosing durable. File storage
 does not load node:sqlite or Pi Durable. Merely installing a driver never switches
 the active backend.

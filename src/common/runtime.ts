@@ -2,12 +2,23 @@ import type {
   ExtensionAPI,
   ExtensionContext,
   ExtensionCommandContext,
+  InputEvent,
+  InputEventResult,
+  MessageEndEvent,
+  MessageEndEventResult,
+  ModelSelectEvent,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { mkdir, readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { hostname } from "node:os";
 import { loadConfig, saveConfig, type Config } from "./config.js";
+import {
+  loadProjectLocale,
+  saveProjectLocale,
+  translate,
+  type Locale,
+} from "./i18n.js";
 import {
   FileStorage,
   SqliteStorage,
@@ -28,6 +39,7 @@ export interface CommandContext {
   cwd: string;
   trusted: boolean;
   signal?: AbortSignal;
+  locale?: Locale;
   hostContext?: ExtensionContext;
   commandContext?: ExtensionCommandContext;
 }
@@ -43,8 +55,26 @@ export interface Service {
     context: CommandContext,
   ): Promise<unknown>;
   start?(): Promise<void>;
+  sessionStart?(context: ExtensionContext): Promise<void>;
   close?(): Promise<void>;
+  input?(
+    event: InputEvent,
+    context: ExtensionContext,
+  ): Promise<InputEventResult | undefined>;
+  modelSelect?(
+    event: ModelSelectEvent,
+    context: ExtensionContext,
+  ): Promise<void>;
   prompt?(prompt: string, context: ExtensionContext): Promise<unknown>;
+  planModePrompt?(prompt: string, context: ExtensionContext): Promise<unknown>;
+  planModeMessageEnd?(
+    event: MessageEndEvent,
+    context: ExtensionContext,
+  ): Promise<MessageEndEventResult | undefined>;
+  guardToolCall?(
+    event: unknown,
+    context: ExtensionContext,
+  ): Promise<{ block: true; reason: string } | undefined>;
   toolCall?(
     event: unknown,
     context: ExtensionContext,
@@ -308,6 +338,7 @@ export function register(
   command: string,
   factory: ServiceFactory,
   tools: ToolDefinition[] = [],
+  aliases: string[] = [],
 ) {
   let host: Host | undefined;
   const get = async (ctx: ExtensionContext) => {
@@ -333,53 +364,52 @@ export function register(
       display: true,
     });
   pi.on("session_start", async (_e, ctx) => {
-    await get(ctx);
+    const h = await get(ctx);
+    await h.serial(
+      () => h.service.sessionStart?.(ctx) ?? Promise.resolve(),
+    );
   });
   pi.on("session_shutdown", async () => {
     await host?.close();
     host = undefined;
   });
-  pi.registerCommand(command, {
-    description: `${extension}: status, explain, config, doctor`,
+  const commandDefinition = {
+    description:
+      `${extension}: status, explain, config, doctor` +
+      (extension === "pi-autoplan" ? ", plan-mode" : ""),
     handler: async (args, ctx) => {
       const h = await get(ctx);
       let parts = args.trim().split(/\s+/).filter(Boolean);
       const interactive = ctx.mode === "tui" && ctx.hasUI;
+      const localized = extension === "pi-autoplan" && interactive;
+      const loadedLocale = localized
+        ? await loadProjectLocale(ctx.cwd, ctx.isProjectTrusted())
+        : { locale: "en" as Locale, invalid: false };
+      let locale = loadedLocale.locale;
+      const tr = (key: string) => translate(locale, key);
       const displayNames: Record<string, string> = {
         longrun: "Longrun",
         autoskills: "AutoSkills",
-        autoplan: "AutoPlan",
+        autoplan: "Plan",
+        plan: "Plan",
         subagents: "Subagent Router",
         mcprouter: "MCP Router",
       };
       const displayName = displayNames[command] ?? extension;
-      const groups = h.service.menuGroups ?? {
+      const baseGroups = h.service.menuGroups ?? {
         Actions: h.service.menu,
         Settings: ["config", "doctor"],
       };
-      const options = [
-        {
-          action: "auto" as const,
-          label: "Automatic",
-          description:
-            h.service.modeDescriptions?.auto ??
-            "Allow eligible actions when this extension's policy permits.",
-        },
-        {
-          action: "observe" as const,
-          label: "Observe",
-          description:
-            h.service.modeDescriptions?.observe ??
-            "Show decisions without acting automatically.",
-        },
-        {
-          action: "off" as const,
-          label: "Off",
-          description:
-            h.service.modeDescriptions?.off ??
-            "Disable this extension's automatic behavior.",
-        },
-      ];
+      const groups: Record<string, string[]> = Object.fromEntries(
+        Object.entries(baseGroups).map(([group, actions]) => [group, [...actions]]),
+      );
+      if (localized)
+        groups.Settings = [
+          ...(groups.Settings ?? []).filter((action) => action !== "language"),
+          "language",
+        ];
+      const modeOptions = ["auto", "observe", "off"] as const;
+      const languageOptions: Locale[] = ["en", "pt-BR"];
       const formatKey = (key: string) =>
         ({
           enter: "Enter",
@@ -391,175 +421,899 @@ export function register(
         })[key.toLowerCase()] ?? key.toUpperCase();
       const keyText = (keys: string[], fallback: string) =>
         keys.map(formatKey).join(" / ") || fallback;
-      const currentMode = () =>
+      type PlannerMode = "auto" | "observe" | "off";
+      const currentMode = (): PlannerMode =>
         !h.config.enabled || h.config.mode === "off"
           ? "off"
           : h.config.mode === "observe"
             ? "observe"
             : "auto";
-      const showModePanel = async () => {
-        let activeAction = currentMode();
-        let selectedIndex = options.findIndex(
-          (option) => option.action === activeAction,
+      const modeLabel = (mode: string) =>
+        tr(
+          mode === "observe"
+            ? "mode.observe"
+            : mode === "off"
+              ? "mode.off"
+              : "mode.automatic",
         );
-        let status = "";
-        await ctx.ui.custom<void>(
-          (tui, theme, keybindings, done) => {
-            let saving = false;
-            const confirmKeys = keyText(
-              keybindings.getKeys("tui.select.confirm"),
-              "Enter",
-            );
-            const cancelKeys = keyText(
-              keybindings.getKeys("tui.select.cancel"),
-              "Esc",
-            );
-            const upKeys = keyText(keybindings.getKeys("tui.select.up"), "↑");
-            const downKeys = keyText(
-              keybindings.getKeys("tui.select.down"),
-              "↓",
-            );
-            const fit = (line: string, width: number) =>
-              line.length <= width
-                ? line
-                : line.slice(0, Math.max(0, width - 1)) + "…";
-
-            return {
-              render(width) {
-                const current =
-                  options.find((option) => option.action === activeAction) ??
-                  options[0]!;
-                const selected = options[selectedIndex]!;
-                const lines = [
-                  `${displayName} / Settings / Mode`,
-                  "",
-                  `Current mode: ${current.label}`,
-                  "",
-                  "Choose a mode",
-                  ...options.map(
-                    (option, index) =>
-                      `${index === selectedIndex ? "›" : " "} ${option.label}${
-                        option.action === activeAction ? "  (current)" : ""
-                      }`,
-                  ),
-                  "",
-                  selected.description,
-                  "",
-                  `${upKeys} / ${downKeys} Move    ${confirmKeys} Save    ${cancelKeys} Back`,
-                  status,
-                ];
-                return lines.map((line, index) => {
-                  const visible = fit(line, width).padEnd(width, " ");
-                  const selectedRow = index === 5 + selectedIndex;
-                  const foreground =
-                    index === 0 || index === 4 || selectedRow
-                      ? theme.fg("accent", theme.bold(visible))
-                      : theme.fg("toolOutput", visible);
-                  return theme.bg("toolPendingBg", foreground);
-                });
-              },
-              invalidate() {},
-              async handleInput(data) {
-                if (keybindings.matches(data, "tui.select.cancel")) {
-                  done(undefined);
-                  return;
-                }
-                if (keybindings.matches(data, "tui.select.up")) {
-                  selectedIndex =
-                    (selectedIndex + options.length - 1) % options.length;
-                  tui.requestRender();
-                  return;
-                }
-                if (keybindings.matches(data, "tui.select.down")) {
-                  selectedIndex = (selectedIndex + 1) % options.length;
-                  tui.requestRender();
-                  return;
-                }
-                if (saving || !keybindings.matches(data, "tui.select.confirm"))
-                  return;
-                saving = true;
-                try {
-                  const selected = options[selectedIndex]!;
-                  await h.serial(() =>
-                    h.command(selected.action, [], {
-                      cwd: ctx.cwd,
-                      trusted: ctx.isProjectTrusted(),
-                      hostContext: ctx,
-                      commandContext: ctx,
-                      signal: ctx.signal,
-                    }),
-                  );
-                  activeAction = selected.action;
-                  status = `Saved: ${selected.label}.`;
-                } catch {
-                  status = "Could not save the mode. Try again.";
-                } finally {
-                  saving = false;
-                  tui.requestRender();
-                }
-              },
-            };
-          },
-          {
-            overlay: true,
-            overlayOptions: {
-              width: "72%",
-              maxHeight: 15,
-              anchor: "center",
-              margin: 1,
-            },
-          },
+      const modeDescription = (mode: PlannerMode) => {
+        if (localized)
+          return tr(
+            mode === "observe"
+              ? "mode.description.observe"
+              : mode === "off"
+                ? "mode.description.off"
+                : "mode.description.automatic",
+          );
+        return (
+          h.service.modeDescriptions?.[mode] ??
+          (mode === "observe"
+            ? "Show decisions without acting automatically."
+            : mode === "off"
+              ? "Disable this extension's automatic behavior."
+              : "Allow eligible actions when this extension's policy permits.")
         );
       };
-      const runMenu = async (initialGroup?: string) => {
-        let group = initialGroup;
+      const localeLabel = (value: Locale) =>
+        tr(value === "pt-BR" ? "locale.portuguese" : "locale.english");
+      const groupLabel = (value: string) =>
+        localized
+          ? tr(
+              value === "Plan"
+                ? "group.plan"
+                : value === "History"
+                  ? "group.history"
+                  : value === "Settings"
+                    ? "group.settings"
+                    : value,
+            )
+          : value;
+      const actionLabel = (value: string) => {
+        if (!localized) return value;
+        const [action, ...rest] = value.split(/\s+/);
+        const label = tr(`action.${action}`);
+        return label === `action.${action}`
+          ? value
+          : [label, ...rest].join(" ");
+      };
+      const inputLabel = (action: string, fallback: string) =>
+        localized && action === "validate"
+          ? tr("input.validate")
+          : localized && action === "create"
+            ? tr("input.create")
+            : fallback;
+      const actionFailureStatus = (action: string, error: unknown) => {
+        if (!["create", "validate", "replan"].includes(action))
+          return tr("notice.actionFailed");
+        const code =
+          error && typeof error === "object" && "code" in error
+            ? (error as { code?: unknown }).code
+            : undefined;
+        if (code === "ENOENT") return tr("notice.planFileNotFound");
+        if (code === "EACCES" || code === "EPERM")
+          return tr("notice.planFileUnreadable");
+        if (error instanceof SyntaxError)
+          return tr("notice.planFileInvalidJson");
+        return tr("notice.actionFailed");
+      };
+
+      const segmenter = new Intl.Segmenter(undefined, {
+        granularity: "grapheme",
+      });
+      const graphemes = (value: string) =>
+        Array.from(segmenter.segment(value), (part) => part.segment);
+      const graphemeWidth = (value: string) => {
+        const points = Array.from(value, (character) =>
+          character.codePointAt(0) ?? 0,
+        );
+        if (!points.length) return 0;
+        if (
+          points.some(
+            (point) =>
+              point === 0x200d ||
+              point === 0xfe0f ||
+              (point >= 0x1f1e6 && point <= 0x1f1ff) ||
+              (point >= 0x1f000 && point <= 0x1faff),
+          )
+        )
+          return 2;
+        let width = 0;
+        for (const point of points) {
+          const character = String.fromCodePoint(point);
+          if (
+            /\p{Mark}/u.test(character) ||
+            point === 0x200d ||
+            point === 0xfe0e ||
+            point === 0xfe0f
+          )
+            continue;
+          const wide =
+            point >= 0x1100 &&
+            (point <= 0x115f ||
+              point === 0x2329 ||
+              point === 0x232a ||
+              (point >= 0x2e80 && point <= 0xa4cf) ||
+              (point >= 0xac00 && point <= 0xd7a3) ||
+              (point >= 0xf900 && point <= 0xfaff) ||
+              (point >= 0xfe10 && point <= 0xfe19) ||
+              (point >= 0xfe30 && point <= 0xfe6f) ||
+              (point >= 0xff00 && point <= 0xff60) ||
+              (point >= 0xffe0 && point <= 0xffe6) ||
+              (point >= 0x20000 && point <= 0x3fffd));
+          width = Math.max(width, wide ? 2 : 1);
+        }
+        return width;
+      };
+      const fitLine = (value: string, width: number) => {
+        const cells = Math.max(1, Math.floor(width));
+        const clean = String(value).replace(/[\r\n\t]/g, " ").replace(/\p{Cc}/gu, " ");
+        const parts = graphemes(clean);
+        const totalWidth = parts.reduce(
+          (total, part) => total + graphemeWidth(part),
+          0,
+        );
+        if (totalWidth <= cells)
+          return clean + " ".repeat(Math.max(0, cells - totalWidth));
+        let output = "";
+        let used = 0;
+        for (const part of parts) {
+          const partWidth = graphemeWidth(part);
+          if (partWidth && used + partWidth > cells) break;
+          output += part;
+          used += partWidth;
+        }
+        if (used < cells) {
+          output += "…";
+          used++;
+        }
+        return output + " ".repeat(Math.max(0, cells - used));
+      };
+
+      const fallbackModePanel = async () => {
         while (true) {
-          if (!group) {
-            group = await ctx.ui.select(displayName, Object.keys(groups));
-            if (!group) return;
-          }
+          const savedMode = currentMode();
           const selected = await ctx.ui.select(
-            `${displayName} / ${group}`,
-            groups[group] ?? [],
+            displayName +
+              " / " +
+              groupLabel("Settings") +
+              " / " +
+              tr("page.mode") +
+              " — " +
+              tr("page.currentMode") +
+              ": " +
+              modeLabel(savedMode),
+            modeOptions.map(modeLabel),
+          );
+          if (!selected) return;
+          const draft = modeOptions.find((mode) => modeLabel(mode) === selected);
+          if (!draft) return;
+          const decision = await ctx.ui.select(
+            tr("page.draftMode") + ": " + modeLabel(draft),
+            [tr("key.save") + " draft", tr("key.discard") + " draft"],
+          );
+          if (decision === tr("key.discard") + " draft") continue;
+          if (decision !== tr("key.save") + " draft") return;
+          try {
+            await h.serial(() =>
+              h.command(draft, [], {
+                cwd: ctx.cwd,
+                trusted: ctx.isProjectTrusted(),
+                locale,
+                hostContext: ctx,
+                commandContext: ctx,
+                signal: ctx.signal,
+              }),
+            );
+            return;
+          } catch {
+            ctx.ui.notify(tr("notice.modeSaveFailed"));
+          }
+        }
+      };
+      const fallbackLanguagePanel = async () => {
+        const savedLocale = locale;
+        while (true) {
+          const selected = await ctx.ui.select(
+            displayName +
+              " / " +
+              groupLabel("Settings") +
+              " / " +
+              tr("page.language") +
+              " — " +
+              tr("page.currentLanguage") +
+              ": " +
+              localeLabel(savedLocale),
+            languageOptions.map(localeLabel),
           );
           if (!selected) {
+            locale = savedLocale;
+            return;
+          }
+          const draft = languageOptions.find(
+            (value) => localeLabel(value) === selected,
+          );
+          if (!draft) {
+            locale = savedLocale;
+            return;
+          }
+          locale = draft;
+          const decision = await ctx.ui.select(
+            tr("page.draftLanguage") + ": " + localeLabel(draft),
+            [tr("key.save") + " language", tr("key.discard") + " language"],
+          );
+          if (decision === tr("key.discard") + " language") {
+            locale = savedLocale;
+            return;
+          }
+          if (decision !== tr("key.save") + " language") {
+            locale = savedLocale;
+            return;
+          }
+          try {
+            await saveProjectLocale(
+              ctx.cwd,
+              ctx.isProjectTrusted(),
+              draft,
+              ctx.signal,
+            );
+            return;
+          } catch {
+            ctx.ui.notify(
+              ctx.isProjectTrusted()
+                ? tr("notice.languageSaveFailed")
+                : tr("notice.trustedProjectRequired"),
+            );
+          }
+        }
+      };
+
+      type MenuExit =
+        | { type: "close" }
+        | { type: "input"; title: string; action: string; args: string[] };
+      type PendingMenuAction = {
+        action: string;
+        args: string[];
+        label: string;
+      };
+      const showDashboard = async (
+        initialPage: "groups" | "mode" | "language" = "groups",
+      ): Promise<boolean> => {
+        if (typeof ctx.ui.custom !== "function") return false;
+        const groupNames = Object.keys(groups);
+        let page: "groups" | "actions" | "mode" | "language" = initialPage;
+        let selectedGroup =
+          initialPage === "mode" || initialPage === "language"
+            ? "Settings"
+            : "";
+        let selectedIndex =
+          initialPage === "mode"
+            ? Math.max(0, modeOptions.findIndex((mode) => mode === currentMode()))
+            : initialPage === "language"
+              ? Math.max(0, languageOptions.findIndex((value) => value === locale))
+              : 0;
+        let savedMode = currentMode();
+        let draftMode = savedMode;
+        let savedLocale = locale;
+        let draftLocale = savedLocale;
+        let status = loadedLocale.invalid ? tr("notice.invalidLocale") : "";
+        let escapeArmed = false;
+        let pendingAction: PendingMenuAction | undefined;
+
+        while (true) {
+          let exit: MenuExit | undefined;
+          try {
+            exit = await ctx.ui.custom<MenuExit>(
+              (tui, theme, keybindings, done) => {
+                let disposed = false;
+                let busy = false;
+                let operationId = 0;
+                let operation: AbortController | undefined;
+                const confirmKeys = keyText(
+                  keybindings.getKeys("tui.select.confirm"),
+                  "Enter",
+                );
+                const cancelKeys = keyText(
+                  keybindings.getKeys("tui.select.cancel"),
+                  "Esc",
+                );
+                const upKeys = keyText(
+                  keybindings.getKeys("tui.select.up"),
+                  "↑",
+                );
+                const downKeys = keyText(
+                  keybindings.getKeys("tui.select.down"),
+                  "↓",
+                );
+                const finish = (result: MenuExit) => {
+                  if (disposed) return;
+                  disposed = true;
+                  operation?.abort();
+                  ctx.signal?.removeEventListener("abort", onContextAbort);
+                  done(result);
+                };
+                const onContextAbort = () => finish({ type: "close" });
+                ctx.signal?.addEventListener("abort", onContextAbort, {
+                  once: true,
+                });
+                if (ctx.signal?.aborted) onContextAbort();
+                const isKey = (
+                  data: string,
+                  binding: Parameters<typeof keybindings.matches>[1],
+                  fallback: string[],
+                ) => {
+                  try {
+                    if (keybindings.matches(data, binding)) return true;
+                  } catch {
+                    // The host key matcher is optional in test and fallback UIs.
+                  }
+                  return fallback.includes(data.toLowerCase());
+                };
+                const requestRender = () => {
+                  if (!disposed) tui.requestRender();
+                };
+                const startOperation = (
+                  action: string,
+                  args: string[],
+                  label: string,
+                  modeToSave?: "auto" | "observe" | "off",
+                ) => {
+                  if (busy || disposed) return;
+                  const controller = new AbortController();
+                  const id = ++operationId;
+                  operation = controller;
+                  busy = true;
+                  escapeArmed = false;
+                  status = modeToSave
+                    ? tr("notice.savingMode")
+                    : tr("notice.running") + " " + label + "…";
+                  requestRender();
+                  void h
+                    .serial(() => {
+                      if (controller.signal.aborted)
+                        throw new Error("operation-cancelled");
+                      return h.command(action, args, {
+                        cwd: ctx.cwd,
+                        trusted: ctx.isProjectTrusted(),
+                        locale,
+                        hostContext: ctx,
+                        commandContext: ctx,
+                        signal: controller.signal,
+                      });
+                    })
+                    .then((result) => {
+                      if (disposed || id !== operationId) return;
+                      operation = undefined;
+                      busy = false;
+                      if (controller.signal.aborted) {
+                        status = tr("notice.cancelled");
+                      } else if (modeToSave) {
+                        savedMode = modeToSave;
+                        draftMode = modeToSave;
+                        status =
+                          tr("notice.modeSaved") + ": " + modeLabel(modeToSave) + ".";
+                      } else {
+                        show(result);
+                        status = tr("notice.completed") + ": " + label + ".";
+                      }
+                      requestRender();
+                    })
+                    .catch((error: unknown) => {
+                      if (disposed || id !== operationId) return;
+                      operation = undefined;
+                      busy = false;
+                      status = controller.signal.aborted
+                        ? tr("notice.cancelled")
+                        : modeToSave
+                          ? tr("notice.modeSaveFailed")
+                          : actionFailureStatus(action, error);
+                      requestRender();
+                    });
+                };
+                const startLocaleSave = (localeToSave: Locale) => {
+                  if (busy || disposed) return;
+                  const controller = new AbortController();
+                  const id = ++operationId;
+                  operation = controller;
+                  busy = true;
+                  escapeArmed = false;
+                  status = tr("notice.savingLanguage");
+                  requestRender();
+                  void saveProjectLocale(
+                    ctx.cwd,
+                    ctx.isProjectTrusted(),
+                    localeToSave,
+                    controller.signal,
+                  )
+                    .then(() => {
+                      if (disposed || id !== operationId) return;
+                      operation = undefined;
+                      busy = false;
+                      if (controller.signal.aborted) {
+                        status = tr("notice.cancelled");
+                      } else {
+                        savedLocale = localeToSave;
+                        draftLocale = localeToSave;
+                        locale = localeToSave;
+                        status = tr("notice.languageSaved");
+                      }
+                      requestRender();
+                    })
+                    .catch(() => {
+                      if (disposed || id !== operationId) return;
+                      operation = undefined;
+                      busy = false;
+                      status = controller.signal.aborted
+                        ? tr("notice.cancelled")
+                        : ctx.isProjectTrusted()
+                          ? tr("notice.languageSaveFailed")
+                          : tr("notice.trustedProjectRequired");
+                      requestRender();
+                    });
+                };
+                const selectedLabels = () =>
+                  page === "groups"
+                    ? groupNames.map(groupLabel)
+                    : page === "actions"
+                      ? (groups[selectedGroup] ?? []).map(actionLabel)
+                      : page === "mode"
+                        ? modeOptions.map(modeLabel)
+                        : languageOptions.map(localeLabel);
+                const lines: Array<{
+                  text: string;
+                  heading?: boolean;
+                  selected?: boolean;
+                }> = [];
+                const push = (
+                  text: string,
+                  flags: { heading?: boolean; selected?: boolean } = {},
+                ) => lines.push({ text, ...flags });
+
+                const component = {
+                  render(width: number) {
+                    lines.length = 0;
+                    if (page === "groups") {
+                      push(displayName, { heading: true });
+                      push("");
+                      push(tr("page.currentMode") + ": " + modeLabel(savedMode));
+                      push("");
+                      push(tr("heading.groups"), { heading: true });
+                      groupNames.forEach((group, index) =>
+                        push((index === selectedIndex ? "› " : "  ") + groupLabel(group), {
+                          selected: index === selectedIndex,
+                        }),
+                      );
+                      push("");
+                      push(
+                        upKeys +
+                          " / " +
+                          downKeys +
+                          " " +
+                          tr("key.move") +
+                          "    " +
+                          confirmKeys +
+                          " " +
+                          tr("key.open") +
+                          "    " +
+                          cancelKeys +
+                          " " +
+                          tr("key.close"),
+                      );
+                    } else if (page === "actions") {
+                      push(displayName + " / " + groupLabel(selectedGroup), {
+                        heading: true,
+                      });
+                      push("");
+                      push(tr("heading.actions"), { heading: true });
+                      (groups[selectedGroup] ?? []).forEach((action, index) =>
+                        push((index === selectedIndex ? "› " : "  ") + actionLabel(action), {
+                          selected: index === selectedIndex,
+                        }),
+                      );
+                      push("");
+                      push(
+                        upKeys +
+                          " / " +
+                          downKeys +
+                          " " +
+                          tr("key.move") +
+                          "    " +
+                          confirmKeys +
+                          " " +
+                          tr("key.open") +
+                          "    " +
+                          cancelKeys +
+                          " " +
+                          tr("key.back"),
+                      );
+                    } else if (page === "mode") {
+                      push(displayName + " / " + groupLabel("Settings") + " / " + tr("page.mode"), {
+                        heading: true,
+                      });
+                      push("");
+                      push(tr("page.currentMode") + ": " + modeLabel(savedMode));
+                      push(tr("page.draftMode") + ": " + modeLabel(draftMode));
+                      push("");
+                      push(tr("page.chooseMode"), { heading: true });
+                      modeOptions.forEach((mode, index) =>
+                        push(
+                          (index === selectedIndex ? "› " : "  ") +
+                            modeLabel(mode) +
+                            (mode === savedMode ? "  " + tr("mark.saved") : "") +
+                            (mode === draftMode ? "  " + tr("mark.draft") : ""),
+                          { selected: index === selectedIndex },
+                        ),
+                      );
+                      push("");
+                      const selected = modeOptions[selectedIndex];
+                      push(selected ? modeDescription(selected) : "");
+                      push("");
+                      push(
+                        upKeys +
+                          " / " +
+                          downKeys +
+                          " " +
+                          tr("key.move") +
+                          "    " +
+                          confirmKeys +
+                          " " +
+                          tr("key.chooseDraft") +
+                          "    Ctrl+S " +
+                          tr("key.save") +
+                          "    " +
+                          cancelKeys +
+                          (draftMode === savedMode
+                            ? " " + tr("key.back")
+                            : " " + tr("key.backDiscard")),
+                      );
+                    } else {
+                      push(displayName + " / " + groupLabel("Settings") + " / " + tr("page.language"), {
+                        heading: true,
+                      });
+                      push("");
+                      push(tr("page.currentLanguage") + ": " + localeLabel(savedLocale));
+                      push(tr("page.draftLanguage") + ": " + localeLabel(draftLocale));
+                      push("");
+                      push(tr("page.chooseLanguage"), { heading: true });
+                      languageOptions.forEach((value, index) =>
+                        push(
+                          (index === selectedIndex ? "› " : "  ") +
+                            localeLabel(value) +
+                            (value === savedLocale ? "  " + tr("mark.saved") : "") +
+                            (value === draftLocale ? "  " + tr("mark.draft") : ""),
+                          { selected: index === selectedIndex },
+                        ),
+                      );
+                      push("");
+                      push(
+                        upKeys +
+                          " / " +
+                          downKeys +
+                          " " +
+                          tr("key.move") +
+                          "    " +
+                          confirmKeys +
+                          " " +
+                          tr("key.chooseLanguage") +
+                          "    Ctrl+S " +
+                          tr("key.save") +
+                          "    " +
+                          cancelKeys +
+                          (draftLocale === savedLocale
+                            ? " " + tr("key.back")
+                            : " " + tr("key.backDiscard")),
+                      );
+                    }
+                    if (busy) push(tr("notice.working"));
+                    if (status) push(status);
+                    return lines.map((line) => {
+                      const visible = fitLine(line.text, width);
+                      const foreground =
+                        line.heading || line.selected
+                          ? theme.fg("accent", theme.bold(visible))
+                          : theme.fg("toolOutput", visible);
+                      return theme.bg("toolPendingBg", foreground);
+                    });
+                  },
+                  invalidate() {},
+                  async handleInput(data: string) {
+                    if (disposed) return;
+                    if (
+                      isKey(data, "tui.select.cancel", [
+                        "escape",
+                        "\u001b",
+                      ])
+                    ) {
+                      if (busy) {
+                        operation?.abort();
+                        status = tr("notice.cancelling");
+                        requestRender();
+                        return;
+                      }
+                      const hasUnsavedDraft =
+                        (page === "mode" && draftMode !== savedMode) ||
+                        (page === "language" && draftLocale !== savedLocale);
+                      if (hasUnsavedDraft) {
+                        if (!escapeArmed) {
+                          escapeArmed = true;
+                          status = tr("notice.unsavedDraft");
+                          requestRender();
+                          return;
+                        }
+                        if (page === "mode") draftMode = savedMode;
+                        else {
+                          draftLocale = savedLocale;
+                          locale = savedLocale;
+                        }
+                        escapeArmed = false;
+                        selectedIndex =
+                          page === "mode"
+                            ? Math.max(0, modeOptions.findIndex((mode) => mode === savedMode))
+                            : Math.max(0, languageOptions.findIndex((value) => value === savedLocale));
+                        page = "actions";
+                        status = tr("notice.draftDiscarded");
+                        requestRender();
+                        return;
+                      }
+                      escapeArmed = false;
+                      status = "";
+                      if (page === "mode") {
+                        page = "actions";
+                        selectedIndex = Math.max(
+                          0,
+                          (groups[selectedGroup] ?? []).findIndex(
+                            (action) =>
+                              action.split(/\s+/)[0] === "config" ||
+                              action.split(/\s+/)[0] === "mode",
+                          ),
+                        );
+                      } else if (page === "language") {
+                        page = "actions";
+                        selectedIndex = Math.max(
+                          0,
+                          (groups[selectedGroup] ?? []).findIndex(
+                            (action) => action.split(/\s+/)[0] === "language",
+                          ),
+                        );
+                      } else if (page === "actions") {
+                        page = "groups";
+                        selectedIndex = Math.max(
+                          0,
+                          groupNames.indexOf(selectedGroup),
+                        );
+                      } else {
+                        finish({ type: "close" });
+                      }
+                      requestRender();
+                      return;
+                    }
+                    if (busy) return;
+                    if (
+                      (page === "mode" || page === "language") &&
+                      (data === "\u0013" || data.toLowerCase() === "ctrl+s")
+                    ) {
+                      if (page === "mode") {
+                        if (draftMode === savedMode) {
+                          status = tr("notice.modeAlreadySaved");
+                          requestRender();
+                          return;
+                        }
+                        startOperation(
+                          draftMode,
+                          [],
+                          "mode " + draftMode,
+                          draftMode,
+                        );
+                      } else if (draftLocale === savedLocale) {
+                        status = tr("notice.languageAlreadySaved");
+                        requestRender();
+                      } else {
+                        startLocaleSave(draftLocale);
+                      }
+                      return;
+                    }
+                    if (isKey(data, "tui.select.up", ["up", "\u001b[A"])) {
+                      const count = selectedLabels().length;
+                      if (count) selectedIndex = (selectedIndex + count - 1) % count;
+                      escapeArmed = false;
+                      status = "";
+                      requestRender();
+                      return;
+                    }
+                    if (isKey(data, "tui.select.down", ["down", "\u001b[B"])) {
+                      const count = selectedLabels().length;
+                      if (count) selectedIndex = (selectedIndex + 1) % count;
+                      escapeArmed = false;
+                      status = "";
+                      requestRender();
+                      return;
+                    }
+                    if (!isKey(data, "tui.select.confirm", ["enter", "\r"]))
+                      return;
+                    escapeArmed = false;
+                    status = "";
+                    if (page === "groups") {
+                      selectedGroup = groupNames[selectedIndex] ?? groupNames[0] ?? "";
+                      page = "actions";
+                      selectedIndex = 0;
+                      requestRender();
+                      return;
+                    }
+                    if (page === "actions") {
+                      const selected = (groups[selectedGroup] ?? [])[selectedIndex];
+                      if (!selected) return;
+                      const tokens = selected.split(/\s+/).filter(Boolean);
+                      const action = tokens.shift() ?? "status";
+                      if (action === "config" || action === "mode") {
+                        page = "mode";
+                        draftMode = savedMode;
+                        selectedIndex = Math.max(
+                          0,
+                          modeOptions.findIndex((mode) => mode === savedMode),
+                        );
+                        status = tr("notice.modeSaveHelp");
+                        requestRender();
+                        return;
+                      }
+                      if (action === "language" && localized) {
+                        page = "language";
+                        savedLocale = locale;
+                        draftLocale = savedLocale;
+                        selectedIndex = Math.max(
+                          0,
+                          languageOptions.findIndex((value) => value === savedLocale),
+                        );
+                        status = "";
+                        requestRender();
+                        return;
+                      }
+                      const inputTitle = h.service.menuInputs?.[selected];
+                      if (inputTitle) {
+                        finish({
+                          type: "input",
+                          title: inputLabel(action, inputTitle),
+                          action,
+                          args: tokens,
+                        });
+                        return;
+                      }
+                      startOperation(action, tokens, actionLabel(selected));
+                      return;
+                    }
+                    if (page === "mode") {
+                      const selected = modeOptions[selectedIndex];
+                      if (!selected) return;
+                      draftMode = selected;
+                      status =
+                        draftMode === savedMode
+                          ? tr("notice.modeDraftMatches")
+                          : tr("notice.modeDraftSelected");
+                      requestRender();
+                      return;
+                    }
+                    const selected = languageOptions[selectedIndex];
+                    if (!selected) return;
+                    draftLocale = selected;
+                    locale = selected;
+                    status =
+                      draftLocale === savedLocale
+                        ? tr("notice.languageDraftMatches")
+                        : tr("notice.languageDraftSelected");
+                    requestRender();
+                  },
+                };
+                if (pendingAction) {
+                  const pending = pendingAction;
+                  pendingAction = undefined;
+                  queueMicrotask(() =>
+                    startOperation(
+                      pending.action,
+                      pending.args,
+                      pending.label,
+                    ),
+                  );
+                }
+                return component;
+              },
+              {
+                overlay: true,
+                overlayOptions: {
+                  width: "72%",
+                  maxHeight: 18,
+                  anchor: "center",
+                  margin: 1,
+                },
+              },
+            );
+          } catch {
+            return false;
+          }
+          if (!exit || exit.type === "close") return true;
+          const value = await ctx.ui.input(exit.title);
+          if (!value?.trim()) {
+            status = tr("notice.inputCancelled");
+            continue;
+          }
+          const label = actionLabel(exit.action) + " " + value.trim();
+          pendingAction = {
+            action: exit.action,
+            args: [...exit.args, value.trim()],
+            label,
+          };
+        }
+      };
+
+      const fallbackRunMenu = async (initialGroup?: string) => {
+        let group = initialGroup;
+        const groupNames = Object.keys(groups);
+        while (true) {
+          if (!group) {
+            const selectedGroupLabel = await ctx.ui.select(
+              displayName,
+              groupNames.map(groupLabel),
+            );
+            if (!selectedGroupLabel) return;
+            group = groupNames[groupNames.map(groupLabel).indexOf(selectedGroupLabel)];
+            if (!group) return;
+          }
+          const actions = groups[group] ?? [];
+          const selectedLabel = await ctx.ui.select(
+            displayName + " / " + groupLabel(group),
+            actions.map(actionLabel),
+          );
+          if (!selectedLabel) {
             group = undefined;
             continue;
           }
-          let selectedParts = selected.split(/\s+/);
+          const selectedIndex = actions.map(actionLabel).indexOf(selectedLabel);
+          const selected = actions[selectedIndex];
+          if (!selected) continue;
+          const selectedParts = selected.split(/\s+/).filter(Boolean);
           const selectedAction = selectedParts[0] ?? "status";
           if (selectedAction === "config" || selectedAction === "mode") {
-            await showModePanel();
+            await fallbackModePanel();
+            continue;
+          }
+          if (selectedAction === "language" && localized) {
+            await fallbackLanguagePanel();
             continue;
           }
           const inputTitle = h.service.menuInputs?.[selected];
           if (inputTitle) {
-            const value = await ctx.ui.input(inputTitle);
+            const value = await ctx.ui.input(inputLabel(selectedAction, inputTitle));
             if (!value?.trim()) continue;
             selectedParts.push(value.trim());
           }
           const action = selectedParts.shift() ?? "status";
-          const result = await h.serial(() =>
-            h.command(action, selectedParts, {
-              cwd: ctx.cwd,
-              trusted: ctx.isProjectTrusted(),
-              hostContext: ctx,
-              commandContext: ctx,
-              signal: ctx.signal,
-            }),
-          );
-          show(result);
+          try {
+            const result = await h.serial(() =>
+              h.command(action, selectedParts, {
+                cwd: ctx.cwd,
+                trusted: ctx.isProjectTrusted(),
+                locale,
+                hostContext: ctx,
+                commandContext: ctx,
+                signal: ctx.signal,
+              }),
+            );
+            show(result);
+          } catch (error) {
+            const status = actionFailureStatus(action, error);
+            show({ error: status, next: tr("notice.actionFailed") });
+            ctx.ui.notify?.(status);
+          }
         }
       };
       if (interactive && !parts.length) {
-        await runMenu();
+        if (!(await showDashboard()) && typeof ctx.ui.select === "function") await fallbackRunMenu();
         return;
       }
       let action = parts.shift() ?? "status";
       if (action === "mode") action = "config";
       if (interactive && action === "config") {
-        await showModePanel();
-        await runMenu("Settings");
+        if (!(await showDashboard("mode"))) {
+          await fallbackModePanel();
+          await fallbackRunMenu("Settings");
+        }
         return;
       }
       show(
@@ -567,6 +1321,7 @@ export function register(
           h.command(action, parts, {
             cwd: ctx.cwd,
             trusted: ctx.isProjectTrusted(),
+            locale,
             hostContext: ctx,
             commandContext: ctx,
             signal: ctx.signal,
@@ -574,7 +1329,15 @@ export function register(
         ),
       );
     },
-  });
+  } satisfies Parameters<ExtensionAPI["registerCommand"]>[1];
+  for (const name of [command, ...aliases])
+    pi.registerCommand(name, {
+      ...commandDefinition,
+      description:
+        name === command
+          ? commandDefinition.description
+          : `${extension}: alias for /${command}`,
+    });
   for (const t of tools)
     pi.registerTool({
       ...t,
@@ -583,14 +1346,34 @@ export function register(
         return t.execute(callId, input, signal, onUpdate, ctx);
       },
     });
+  pi.on("input", async (e, ctx) => {
+    const h = await get(ctx);
+    return h.serial(
+      () => h.service.input?.(e, ctx) ?? Promise.resolve(undefined),
+    );
+  });
+  pi.on("model_select", async (e, ctx) => {
+    const h = await get(ctx);
+    await h.serial(
+      () => h.service.modelSelect?.(e, ctx) ?? Promise.resolve(),
+    );
+  });
   pi.on("before_agent_start", async (e, ctx) => {
     const h = await get(ctx);
-    if (
-      !h.config.enabled ||
-      h.config.mode === "off" ||
-      e.messageType !== "user"
-    )
-      return;
+    if (e.messageType !== "user") return;
+    const planModeValue = await h.serial(
+      () =>
+        h.service.planModePrompt?.(e.prompt, ctx) ?? Promise.resolve(undefined),
+    );
+    if (planModeValue !== undefined)
+      return {
+        message: {
+          customType: `${extension}.plan-mode`,
+          content: JSON.stringify(redact(planModeValue)),
+          display: false,
+        },
+      };
+    if (!h.config.enabled || h.config.mode === "off") return;
     const value = await h.serial(
       () => h.service.prompt?.(e.prompt, ctx) ?? Promise.resolve(undefined),
     );
@@ -605,6 +1388,10 @@ export function register(
   });
   pi.on("tool_call", async (e, ctx) => {
     const h = await get(ctx);
+    const guard = await h.serial(
+      () => h.service.guardToolCall?.(e, ctx) ?? Promise.resolve(undefined),
+    );
+    if (guard) return guard;
     if (h.config.enabled)
       return h.serial(
         () => h.service.toolCall?.(e, ctx) ?? Promise.resolve(undefined),
@@ -617,6 +1404,11 @@ export function register(
   });
   pi.on("message_end", async (e, ctx) => {
     const h = await get(ctx);
+    const planModeResult = await h.serial(
+      () =>
+        h.service.planModeMessageEnd?.(e, ctx) ?? Promise.resolve(undefined),
+    );
+    if (planModeResult) return planModeResult;
     if (h.config.enabled)
       await h.serial(() => h.service.messageEnd?.(e, ctx) ?? Promise.resolve());
   });
