@@ -1,10 +1,15 @@
 # Configuration
 
-Installing starts with safe defaults. `/autoplan config` opens a mode wizard in
+Installing starts with safe defaults. `/plan config` opens a mode wizard in
 TUI or displays validated config in headless modes. User settings are stored in
 `~/.pi/agent/state/pi-autoplan/config.json` (or under PI_ECOSYSTEM_STATE_ROOT).
 `schemas/config.schema.json` is the complete machine-readable schema, and
 `defaults()` / `validateConfig()` are the public TypeScript implementations.
+
+The Plan group's `plan-mode` action is separate from these saved automatic
+planning settings. It applies only to the current Pi session, requires a
+selected model and a discovery choice, and blocks model tool calls until it is
+turned off or a new Pi session starts.
 
 Precedence: user-command override, trusted project `.pi/pi-autoplan.json`, user config,
 built-in defaults. Project config is read only after Pi project trust. Project

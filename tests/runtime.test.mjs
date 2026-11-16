@@ -18,7 +18,7 @@ const name = JSON.parse(
 const displayName =
   {
     "pi-autoskills": "AutoSkills",
-    "pi-autoplan": "AutoPlan",
+    "pi-autoplan": "Plan",
     "pi-subagent-router": "Subagent Router",
     "pi-mcp-router": "MCP Router",
   }[name] ?? name;
@@ -66,6 +66,7 @@ test("safe configuration rejects model escalation and malformed numeric values",
   assert.equal(c.storage.backend, "files");
   assert.throws(() => validateConfig({ ...c, assistantClaims: true }));
   assert.throws(() => validateConfig({ ...c, requireApproval: false }));
+  assert.throws(() => validateConfig({ ...c, mode: "invalid" }));
   assert.throws(() => validateConfig({ ...c, maxParallel: Infinity }));
   assert.throws(() =>
     validateConfig({ ...c, compactAtRatio: 0.9, handoffAtRatio: 0.7 }),
@@ -109,7 +110,15 @@ test("extension loads independently and all discovery commands work without TUI"
     unregisterMcpServer: () => {},
   };
   extension(pi);
-  assert.equal(commands.size, 1);
+  assert.equal(commands.size, name === "pi-autoplan" ? 2 : 1);
+  if (name === "pi-autoplan") {
+    assert.ok(commands.has("plan"));
+    assert.ok(commands.has("autoplan"));
+    assert.equal(
+      commands.get("plan").handler,
+      commands.get("autoplan").handler,
+    );
+  }
   assert.ok(tools.size >= 1);
   assert.equal(messages.length, 0);
   const ctx = {
@@ -152,32 +161,6 @@ test("extension loads independently and all discovery commands work without TUI"
     { messageType: "user", prompt: "Explain a small function" },
     ctx,
   );
-  const menus = [];
-  let rootSelections = 0;
-  let settingsSelections = 0;
-  const tui = {
-    ...ctx,
-    mode: "tui",
-    hasUI: true,
-    ui: {
-      select: async (title, choices) => {
-        menus.push({ title, choices });
-        if (title === displayName)
-          return rootSelections++ === 0 ? "Settings" : undefined;
-        return settingsSelections++ === 0 ? "doctor" : undefined;
-      },
-    },
-  };
-  await command.handler("", tui);
-  assert.equal(menus.length, 4);
-  assert.ok(menus[0].choices.includes("Settings"));
-  assert.equal(menus[1].title, `${displayName} / Settings`);
-  assert.equal(menus[2].title, `${displayName} / Settings`);
-  assert.equal(menus[3].title, displayName);
-  assert.ok(menus[1].choices.includes("config"));
-  assert.equal(menus[1].choices.includes("off"), false);
-  assert.equal(JSON.parse(messages.at(-1).content).standalone, true);
-
   const keybindings = {
     getKeys: (binding) =>
       ({
@@ -194,81 +177,348 @@ test("extension loads independently and all discovery commands work without TUI"
         "tui.select.down": "down",
       })[binding] === data,
   };
-  const configMenus = [];
-  let panelRuns = 0;
+  const theme = {
+    fg: (_color, value) => value,
+    bg: (_color, value) => value,
+    bold: (value) => value,
+  };
+  const interactions = [];
+  const inputValues = [];
   let closedPanels = 0;
   let renderRequests = 0;
-  const configTui = {
+  const tui = { ...ctx, mode: "tui", hasUI: true, ui: {} };
+  const dashboardTui = {
     ...tui,
     ui: {
-      select: async (title, choices) => {
-        configMenus.push({ title, choices });
-        return undefined;
-      },
+      input: async () => inputValues.shift(),
       custom: async (factory, options) => {
         assert.equal(options.overlay, true);
+        const interact = interactions.shift();
+        assert.equal(typeof interact, "function", "unexpected dashboard panel");
+        let complete;
+        const finished = new Promise((resolve) => {
+          complete = resolve;
+        });
         const panel = await factory(
           { requestRender: () => renderRequests++ },
-          {
-            fg: (_color, value) => value,
-            bg: (_color, value) => value,
-            bold: (value) => value,
-          },
+          theme,
           keybindings,
-          () => closedPanels++,
+          (value) => {
+            closedPanels++;
+            complete(value);
+          },
         );
-        const render = () =>
-          panel
-            .render(80)
-            .map((line) => line.trimEnd())
-            .join("\n");
-        assert.match(render(), new RegExp(`${displayName} / Settings / Mode`));
-        assert.match(render(), /Current mode: Automatic/);
-        assert.match(render(), /Choose a mode\n› Automatic  \(current\)/);
-        await panel.handleInput("down");
-        assert.match(render(), /› Observe/);
-        if (panelRuns++ === 0) {
-          await panel.handleInput("escape");
-          const unchanged = JSON.parse(
-            await readFile(
-              join(defaults(name).storage.root, "config.json"),
-              "utf8",
-            ),
-          );
-          assert.equal(unchanged.mode, "auto");
-          assert.equal(unchanged.enabled, true);
-        } else {
-          await panel.handleInput("enter");
-          assert.match(render(), /Current mode: Observe/);
-          assert.match(render(), /Saved: Observe\./);
-          const saved = JSON.parse(
-            await readFile(
-              join(defaults(name).storage.root, "config.json"),
-              "utf8",
-            ),
-          );
-          assert.equal(saved.mode, "observe");
-          assert.equal(saved.enabled, true);
-          await panel.handleInput("escape");
-        }
+        const render = (width = 80) => panel.render(width).join("\n");
+        await interact({ panel, render });
+        return await finished;
       },
     },
   };
-  await command.handler("config", configTui);
-  await command.handler("config", configTui);
-  assert.equal(panelRuns, 2);
-  assert.equal(closedPanels, 2);
-  assert.equal(renderRequests, 3);
-  assert.deepEqual(
-    configMenus.map(({ title }) => title),
-    [
-      `${displayName} / Settings`,
-      displayName,
-      `${displayName} / Settings`,
-      displayName,
-    ],
-  );
+  const cellWidth = (value) => {
+    const segmenter = new Intl.Segmenter(undefined, {
+      granularity: "grapheme",
+    });
+    return Array.from(segmenter.segment(value), ({ segment }) => {
+      const points = Array.from(segment, (character) =>
+        character.codePointAt(0) ?? 0,
+      );
+      if (
+        points.some(
+          (point) =>
+            point === 0x200d ||
+            point === 0xfe0f ||
+            (point >= 0x1f1e6 && point <= 0x1f1ff) ||
+            (point >= 0x1f000 && point <= 0x1faff),
+        )
+      )
+        return 2;
+      let width = 0;
+      for (const point of points) {
+        const character = String.fromCodePoint(point);
+        if (/\p{Mark}/u.test(character) || point === 0x200d) continue;
+        const wide =
+          point >= 0x1100 &&
+          (point <= 0x115f ||
+            point === 0x2329 ||
+            point === 0x232a ||
+            (point >= 0x2e80 && point <= 0xa4cf) ||
+            (point >= 0xac00 && point <= 0xd7a3) ||
+            (point >= 0xf900 && point <= 0xfaff) ||
+            (point >= 0xfe10 && point <= 0xfe19) ||
+            (point >= 0xfe30 && point <= 0xfe6f) ||
+            (point >= 0xff00 && point <= 0xff60) ||
+            (point >= 0xffe0 && point <= 0xffe6) ||
+            (point >= 0x20000 && point <= 0x3fffd));
+        width = Math.max(width, wide ? 2 : 1);
+      }
+      return width;
+    }).reduce((total, width) => total + width, 0);
+  };
+  const waitFor = async (predicate, message) => {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (predicate()) return;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.fail(message);
+  };
+  const configPath = join(defaults(name).storage.root, "config.json");
 
+  interactions.push(async ({ panel, render }) => {
+    for (const width of [40, 80, 120]) {
+      const lines = panel.render(width);
+      assert.ok(lines.every((line) => cellWidth(line) === width));
+    }
+    assert.match(render(), new RegExp(displayName));
+    assert.match(render(), /Current mode: Automatic/);
+    assert.match(render(), /Groups/);
+    assert.match(render(), /› Plan/);
+
+    await panel.handleInput("enter");
+    assert.match(render(), /status/i);
+    assert.match(render(), /show/i);
+    assert.match(render(), /create/i);
+    assert.match(render(), /replan/i);
+    await panel.handleInput("escape");
+
+    await panel.handleInput("down");
+    await panel.handleInput("enter");
+    assert.match(render(), /history/i);
+    await panel.handleInput("escape");
+
+    await panel.handleInput("down");
+    await panel.handleInput("enter");
+    assert.match(render(), /mode/i);
+    assert.match(render(), /doctor/i);
+    await panel.handleInput("enter");
+    assert.match(render(), /Current mode: Automatic/);
+    assert.match(render(), /Draft mode: Automatic/);
+    await panel.handleInput("down");
+    await panel.handleInput("enter");
+    assert.match(render(), /Draft mode: Observe/);
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).mode, "auto");
+
+    await panel.handleInput("escape");
+    assert.match(render(), /Press Esc again to discard/);
+    await panel.handleInput("escape");
+    assert.match(render(), /Draft discarded/);
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).mode, "auto");
+    await panel.handleInput("escape");
+    await panel.handleInput("escape");
+  });
+  await command.handler("", dashboardTui);
+
+  interactions.push(async ({ panel, render }) => {
+    await panel.handleInput("down");
+    await panel.handleInput("down");
+    await panel.handleInput("enter");
+    await panel.handleInput("enter");
+    await panel.handleInput("down");
+    await panel.handleInput("enter");
+    assert.match(render(), /Draft mode: Observe/);
+    const savedBefore = await readFile(configPath, "utf8");
+    assert.equal(JSON.parse(savedBefore).mode, "auto");
+
+    await rm(configPath, { force: true });
+    await mkdir(configPath);
+    await panel.handleInput("\u0013");
+    await waitFor(
+      () => render().includes("Could not save the mode"),
+      "mode save failure should be shown without losing the draft",
+    );
+    assert.match(render(), /Current mode: Automatic/);
+    assert.match(render(), /Draft mode: Observe/);
+
+    await rm(configPath, { recursive: true, force: true });
+    await writeFile(configPath, savedBefore);
+    await panel.handleInput("\u0013");
+    await waitFor(
+      () => render().includes("Saved mode: Observe"),
+      "Ctrl+S should persist a valid mode draft",
+    );
+    const saved = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(saved.mode, "observe");
+    assert.equal(saved.enabled, true);
+    await panel.handleInput("escape");
+    await panel.handleInput("escape");
+    await panel.handleInput("escape");
+  });
+  await command.handler("", dashboardTui);
+
+  inputValues.push("计划-🙂.json");
+  interactions.push(async ({ panel }) => {
+    await panel.handleInput("enter");
+    await panel.handleInput("down");
+    await panel.handleInput("down");
+    await panel.handleInput("down");
+    await panel.handleInput("enter");
+  });
+  interactions.push(async ({ panel, render }) => {
+    assert.match(render(), /Running create 计划-🙂\.json/i);
+    for (const width of [40, 80, 120]) {
+      const lines = panel.render(width);
+      assert.ok(lines.every((line) => cellWidth(line) === width));
+    }
+    const activation = panel.handleInput("enter");
+    await panel.handleInput("escape");
+    await activation;
+    await waitFor(
+      () => render().includes("Cancelled. The menu is ready."),
+      "Esc should cancel the pending action and leave the menu usable",
+    );
+    await panel.handleInput("escape");
+    await panel.handleInput("escape");
+  });
+  const messagesBeforeCancelledAction = messages.length;
+  await command.handler("", dashboardTui);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(messages.length, messagesBeforeCancelledAction);
+
+  inputValues.push("missing-plan.json");
+  interactions.push(async ({ panel }) => {
+    await panel.handleInput("enter");
+    await panel.handleInput("down");
+    await panel.handleInput("down");
+    await panel.handleInput("down");
+    await panel.handleInput("enter");
+  });
+  interactions.push(async ({ panel, render }) => {
+    await waitFor(
+      () => render().includes("Plan file not found"),
+      "a missing plan should explain the cause and leave the menu usable",
+    );
+    assert.match(render(), /Create/);
+    assert.match(render(), /project-relative path/);
+    await panel.handleInput("escape");
+    await panel.handleInput("escape");
+  });
+  const messagesBeforeMissingPlan = messages.length;
+  await command.handler("", dashboardTui);
+  assert.equal(messages.length, messagesBeforeMissingPlan);
+
+  const lateAbort = new AbortController();
+  inputValues.push("late-遅延-🙂.json");
+  interactions.push(async ({ panel }) => {
+    await panel.handleInput("enter");
+    await panel.handleInput("down");
+    await panel.handleInput("down");
+    await panel.handleInput("down");
+    await panel.handleInput("enter");
+  });
+  interactions.push(async ({ render }) => {
+    assert.match(render(), /Running create late-遅延-🙂\.json/i);
+    lateAbort.abort();
+  });
+  const messagesBeforeLateCallback = messages.length;
+  await command.handler("", { ...dashboardTui, signal: lateAbort.signal });
+  for (let attempt = 0; attempt < 100; attempt++)
+    await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(messages.length, messagesBeforeLateCallback);
+
+  if (name === "pi-autoplan") {
+    await command.handler("auto", ctx);
+    const localeTui = { ...dashboardTui, isProjectTrusted: () => true };
+    const projectLocalePath = join(cwd, ".pi", "pi-autoplan.locale.json");
+    interactions.push(async ({ panel, render }) => {
+      assert.match(render(), /Current mode: Automatic/);
+      assert.match(render(), /Groups/);
+      for (const width of [40, 80, 120])
+        assert.ok(panel.render(width).every((line) => cellWidth(line) === width));
+      await panel.handleInput("down");
+      await panel.handleInput("down");
+      await panel.handleInput("enter");
+      assert.match(render(), /Language/);
+      assert.match(render(), /Doctor/);
+      await panel.handleInput("down");
+      await panel.handleInput("down");
+      await panel.handleInput("down");
+      await panel.handleInput("enter");
+      assert.match(render(), /Current language: English/);
+      assert.match(render(), /Português \(Brasil\)/);
+      await panel.handleInput("down");
+      await panel.handleInput("enter");
+      assert.match(render(), /Idioma atual: Inglês/);
+      assert.match(render(), /Rascunho do idioma: Português \(Brasil\)/);
+      assert.equal(await readFile(projectLocalePath, "utf8").catch(() => null), null);
+      for (const width of [40, 80, 120])
+        assert.ok(panel.render(width).every((line) => cellWidth(line) === width));
+      await panel.handleInput("ctrl+s");
+      await waitFor(() => render().includes("Idioma salvo."), "Ctrl+S saves the trusted project language");
+      assert.deepEqual(JSON.parse(await readFile(projectLocalePath, "utf8")), {
+        locale: "pt-BR",
+        schemaVersion: 1,
+      });
+      await panel.handleInput("escape");
+      assert.match(render(), /Diagnóstico/);
+      assert.match(render(), /Idioma/);
+      await panel.handleInput("up");
+      await panel.handleInput("up");
+      await panel.handleInput("up");
+      await panel.handleInput("enter");
+      assert.match(render(), /Modo atual: Automático/);
+      assert.match(render(), /Observar/);
+      assert.match(render(), /Desativado/);
+      assert.doesNotMatch(render(), /Current mode:|Automatic/);
+      await panel.handleInput("escape");
+      await panel.handleInput("escape");
+      await panel.handleInput("escape");
+    });
+    await command.handler("", localeTui);
+
+    await writeFile(join(cwd, "broken-plan.json"), "{ invalid json", "utf8");
+    inputValues.push("broken-plan.json");
+    interactions.push(async ({ panel }) => {
+      await panel.handleInput("enter");
+      await panel.handleInput("down");
+      await panel.handleInput("down");
+      await panel.handleInput("down");
+      await panel.handleInput("enter");
+    });
+    interactions.push(async ({ panel, render }) => {
+      await waitFor(
+        () => render().includes("O arquivo do plano não é um JSON válido"),
+        "an invalid plan should show a localized safe error and leave the menu usable",
+      );
+      assert.match(render(), /Criar/);
+      assert.doesNotMatch(render(), /SyntaxError|broken-plan\.json/);
+      await panel.handleInput("escape");
+      await panel.handleInput("escape");
+    });
+    const messagesBeforeInvalidPlan = messages.length;
+    await command.handler("", localeTui);
+    assert.equal(messages.length, messagesBeforeInvalidPlan);
+
+    interactions.push(async ({ panel, render }) => {
+      assert.match(render(), /Modo atual: Automático/);
+      assert.match(render(), /Grupos/);
+      assert.match(render(), /Plano/);
+      await panel.handleInput("down");
+      await panel.handleInput("down");
+      await panel.handleInput("enter");
+      await panel.handleInput("down");
+      await panel.handleInput("down");
+      await panel.handleInput("down");
+      await panel.handleInput("enter");
+      assert.match(render(), /Idioma atual: Português \(Brasil\)/);
+      await panel.handleInput("up");
+      await panel.handleInput("enter");
+      assert.match(render(), /Current language: Português \(Brasil\)/);
+      assert.match(render(), /Draft language: English/);
+      await panel.handleInput("escape");
+      assert.match(render(), /Unsaved draft/);
+      await panel.handleInput("escape");
+      assert.match(render(), /Idioma/);
+      assert.deepEqual(JSON.parse(await readFile(projectLocalePath, "utf8")), {
+        locale: "pt-BR",
+        schemaVersion: 1,
+      });
+      await panel.handleInput("escape");
+      await panel.handleInput("escape");
+    });
+    await command.handler("", localeTui);
+  }
+
+  assert.ok(closedPanels >= 4);
+  assert.ok(renderRequests > 0);
   const priorMessages = messages.length;
   await command.handler("", { ...tui, ui: { select: async () => undefined } });
   assert.equal(messages.length, priorMessages);

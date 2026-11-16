@@ -1,8 +1,10 @@
+import { getAgentDir, } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { register, toolResult } from "./common/runtime.js";
 import { createService, PlanInputSchema, } from "./plan.js";
+import { planShortcutIsFree } from "./common/shortcut-migration.js";
 export default function (pi) {
-    const runtime = register(pi, "pi-autoplan", "autoplan", createService);
+    const runtime = register(pi, "pi-autoplan", "plan", createService, [], ["autoplan"]);
     pi.registerTool({
         name: "autoplan_update",
         label: "Update plan",
@@ -21,4 +23,20 @@ export default function (pi) {
             });
         },
     });
+    // Shift+Tab is reserved by Pi for app.thinking.cycle. Only claim it after
+    // the user has moved that binding in keybindings.json and restarted Pi.
+    if (planShortcutIsFree(getAgentDir())) {
+        pi.registerShortcut("shift+tab", {
+            description: "Toggle Normal and Plan mode",
+            handler: async (ctx) => {
+                const h = await runtime.get(ctx);
+                await h.serial(() => h.command("plan-mode", [], {
+                    cwd: ctx.cwd,
+                    trusted: ctx.isProjectTrusted(),
+                    hostContext: ctx,
+                    signal: ctx.signal,
+                }));
+            },
+        });
+    }
 }

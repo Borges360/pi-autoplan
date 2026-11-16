@@ -34,6 +34,8 @@
     "dist",
     "schemas",
     "README.md",
+    "docs/assets/inteiro-mark.svg",
+    "docs/assets/INTEIRO-MARK-LICENSE.txt",
     "ARCHITECTURE.md",
     "CONFIGURATION.md",
     "SECURITY.md",
@@ -59,6 +61,7 @@
     "fast-xml-parser": "5.11.2"
   },
   "peerDependencies": {
+    "@earendil-works/pi-tui": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-durable": "1.2.0",
     "typebox": "*"
